@@ -1,0 +1,386 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+ 
+#define MAX_PATIENTS   100
+#define NAME_LEN        50
+#define DATA_FILE       "patients.dat"
+ 
+/* ---------- Risk levels ------------------------------------------------ */
+typedef enum { LOW = 0, MODERATE, HIGH, CRITICAL } RiskLevel;
+ 
+const char *riskName(RiskLevel r) {
+    switch (r) {
+        case LOW:      return "LOW";
+        case MODERATE: return "MODERATE";
+        case HIGH:     return "HIGH";
+        case CRITICAL: return "CRITICAL";
+        default:       return "UNKNOWN";
+    }
+}
+ 
+/* ---------- a) Patient structure ---------------------------------------- */
+typedef struct {
+    int   patientID;
+    char  name[NAME_LEN];
+    int   age;
+    int   heartRate;      /* beats per minute            */
+    float temperature;    /* degrees Celsius             */
+    int   spo2;           /* oxygen saturation, %        */
+    RiskLevel risk;
+} Patient;
+ 
+/* ---------- Global in-memory store -------------------------------------
+   A fixed array is used for simplicity and to make the file I/O trivial
+   (fixed-size records). Section (e) below discusses the scalability
+   trade-off and a better alternative for large record counts.
+   ------------------------------------------------------------------- */
+Patient patients[MAX_PATIENTS];
+int patientCount = 0;
+ 
+void saveToFile(void);   /* forward declaration: used by input-EOF guards below */
+ 
+/* =========================================================================
+   b) FUNCTIONS USING STRUCTURE POINTERS
+   ========================================================================= */
+ 
+/* Validates a single vital sign is within a physiologically plausible
+   range. Centralising this prevents inconsistent / impossible data from
+   ever entering a record (see part d). */
+int isValidVitals(int age, int heartRate, float temperature, int spo2) {
+    if (age <= 0 || age > 130)                 return 0;
+    if (heartRate < 20 || heartRate > 250)      return 0;   /* physiological bounds  */
+    if (temperature < 25.0f || temperature > 45.0f) return 0; /* Celsius, survivable range */
+    if (spo2 < 0 || spo2 > 100)                 return 0;
+    return 1;
+}
+ 
+/* Calculates and updates a patient's risk level in place via a pointer.
+   Rule-of-thumb clinical thresholds (simplified for teaching purposes):
+     CRITICAL : SpO2 < 85%  OR temp >= 40.0C OR HR >= 150 OR HR <= 40
+     HIGH     : SpO2 < 90%  OR temp >= 38.5C OR HR >= 120 OR HR <= 50
+     MODERATE : SpO2 < 95%  OR temp >= 37.8C OR HR >= 100 OR HR <= 60
+     LOW      : otherwise                                                  */
+void updateRiskLevel(Patient *p) {
+    if (p == NULL) return;
+ 
+    if (p->spo2 < 85 || p->temperature >= 40.0f || p->heartRate >= 150 || p->heartRate <= 40) {
+        p->risk = CRITICAL;
+    } else if (p->spo2 < 90 || p->temperature >= 38.5f || p->heartRate >= 120 || p->heartRate <= 50) {
+        p->risk = HIGH;
+    } else if (p->spo2 < 95 || p->temperature >= 37.8f || p->heartRate >= 100 || p->heartRate <= 60) {
+        p->risk = MODERATE;
+    } else {
+        p->risk = LOW;
+    }
+}
+ 
+/* Updates the monitored vitals of an existing patient through a pointer,
+   validates them, and recomputes risk. Returns 1 on success, 0 if the
+   supplied values were rejected (record left unchanged). */
+int updateVitalsSafe(Patient *p, int heartRate, float temperature, int spo2) {
+    if (p == NULL) return 0;
+    if (!isValidVitals(p->age, heartRate, temperature, spo2)) return 0;
+ 
+    p->heartRate   = heartRate;
+    p->temperature = temperature;
+    p->spo2        = spo2;
+    updateRiskLevel(p);
+    return 1;
+}
+ 
+/* =========================================================================
+   Helper: input utilities (safe string / numeric reads)
+   ========================================================================= */
+ 
+void flushInputLine(void) {
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF) { /* discard */ }
+}
+ 
+/* Reads a line safely into buf (size bytes), strips the trailing newline,
+   and re-prompts on empty input. Prevents buffer overflows from scanf("%s"). */
+void readLine(const char *prompt, char *buf, size_t size) {
+    while (1) {
+        printf("%s", prompt);
+        if (fgets(buf, (int)size, stdin) == NULL) {
+            printf("\nInput stream closed unexpectedly. Saving and exiting.\n");
+            saveToFile();
+            exit(EXIT_FAILURE);
+        }
+        size_t len = strlen(buf);
+        if (len > 0 && buf[len - 1] == '\n') buf[len - 1] = '\0';
+        else flushInputLine();  /* input longer than buffer: discard remainder */
+ 
+        /* trim leading/trailing spaces */
+        size_t start = 0;
+        while (buf[start] == ' ') start++;
+        if (start > 0) memmove(buf, buf + start, strlen(buf + start) + 1);
+ 
+        if (strlen(buf) > 0) return;
+        printf("  Input cannot be empty. Please try again.\n");
+    }
+}
+ 
+/* Reads an integer within [lo, hi] robustly; re-prompts on non-numeric or
+   out-of-range input instead of crashing or looping forever on bad scanf
+   state (see part f for the failure this specifically guards against). */
+int readIntInRange(const char *prompt, int lo, int hi) {
+    char line[64];
+    int value;
+    while (1) {
+        printf("%s", prompt);
+        if (fgets(line, sizeof(line), stdin) == NULL) {
+            /* EOF or unrecoverable stream error: fgets returning NULL forever
+               would otherwise spin this loop indefinitely (see part f). Fail
+               safely instead of hanging. */
+            printf("\nInput stream closed unexpectedly. Saving and exiting.\n");
+            saveToFile();
+            exit(EXIT_FAILURE);
+        }
+        char *endptr;
+        long v = strtol(line, &endptr, 10);
+        /* skip trailing whitespace/newline after the number */
+        while (*endptr == ' ' || *endptr == '\t' || *endptr == '\n' || *endptr == '\r') endptr++;
+        if (endptr == line || *endptr != '\0') {
+            printf("  Invalid number. Please try again.\n");
+            continue;
+        }
+        value = (int)v;
+        if (value < lo || value > hi) {
+            printf("  Value must be between %d and %d. Please try again.\n", lo, hi);
+            continue;
+        }
+        return value;
+    }
+}
+ 
+float readFloatInRange(const char *prompt, float lo, float hi) {
+    char line[64];
+    float value;
+    while (1) {
+        printf("%s", prompt);
+        if (fgets(line, sizeof(line), stdin) == NULL) {
+            printf("\nInput stream closed unexpectedly. Saving and exiting.\n");
+            saveToFile();
+            exit(EXIT_FAILURE);
+        }
+        char *endptr;
+        double v = strtod(line, &endptr);
+        while (*endptr == ' ' || *endptr == '\t' || *endptr == '\n' || *endptr == '\r') endptr++;
+        if (endptr == line || *endptr != '\0') {
+            printf("  Invalid number. Please try again.\n");
+            continue;
+        }
+        value = (float)v;
+        if (value < lo || value > hi) {
+            printf("  Value must be between %.1f and %.1f. Please try again.\n", lo, hi);
+            continue;
+        }
+        return value;
+    }
+}
+ 
+/* =========================================================================
+   d) Duplicate / consistency guards
+   ========================================================================= */
+ 
+/* Linear search by ID. Returns index or -1. Used both for lookups and for
+   duplicate-ID prevention at registration time. */
+int findPatientIndex(int id) {
+    for (int i = 0; i < patientCount; i++) {
+        if (patients[i].patientID == id) return i;
+    }
+    return -1;
+}
+ 
+/* =========================================================================
+   c) MENU OPERATIONS
+   ========================================================================= */
+ 
+void registerPatient(void) {
+    if (patientCount >= MAX_PATIENTS) {
+        printf("Patient store is full (%d). Cannot register more patients.\n", MAX_PATIENTS);
+        return;
+    }
+ 
+    Patient p;
+    memset(&p, 0, sizeof(p));
+ 
+    p.patientID = readIntInRange("Enter Patient ID (1-999999): ", 1, 999999);
+    if (findPatientIndex(p.patientID) != -1) {
+        printf("Error: Patient ID %d already exists. Registration aborted.\n", p.patientID);
+        return; /* d) duplicate-ID prevention */
+    }
+ 
+    readLine("Enter Patient Name: ", p.name, sizeof(p.name));
+    p.age         = readIntInRange("Enter Age (1-130): ", 1, 130);
+    p.heartRate   = readIntInRange("Enter Heart Rate (20-250 bpm): ", 20, 250);
+    p.temperature = readFloatInRange("Enter Body Temperature (25.0-45.0 C): ", 25.0f, 45.0f);
+    p.spo2        = readIntInRange("Enter Oxygen Saturation (0-100 %): ", 0, 100);
+ 
+    updateRiskLevel(&p);
+    patients[patientCount++] = p;
+ 
+    printf("Patient registered successfully. Calculated risk level: %s\n", riskName(p.risk));
+}
+ 
+void searchPatient(void) {
+    if (patientCount == 0) { printf("No patient records available.\n"); return; }
+    int id = readIntInRange("Enter Patient ID to search: ", 1, 999999);
+    int idx = findPatientIndex(id);
+    if (idx == -1) { printf("No patient found with ID %d.\n", id); return; }
+ 
+    Patient *p = &patients[idx];
+    printf("\n---- Patient Found ----\n");
+    printf("ID: %d | Name: %s | Age: %d\n", p->patientID, p->name, p->age);
+    printf("HR: %d bpm | Temp: %.1f C | SpO2: %d%% | Risk: %s\n",
+           p->heartRate, p->temperature, p->spo2, riskName(p->risk));
+}
+ 
+void updateVitalsMenu(void) {
+    if (patientCount == 0) { printf("No patient records available.\n"); return; }
+    int id = readIntInRange("Enter Patient ID to update: ", 1, 999999);
+    int idx = findPatientIndex(id);
+    if (idx == -1) { printf("No patient found with ID %d.\n", id); return; }
+ 
+    Patient *p = &patients[idx];
+    int hr    = readIntInRange("New Heart Rate (20-250 bpm): ", 20, 250);
+    float t   = readFloatInRange("New Temperature (25.0-45.0 C): ", 25.0f, 45.0f);
+    int spo2  = readIntInRange("New SpO2 (0-100 %): ", 0, 100);
+ 
+    if (updateVitalsSafe(p, hr, t, spo2)) {
+        printf("Vitals updated. New risk level: %s\n", riskName(p->risk));
+    } else {
+        printf("Update rejected: values failed validation. Record unchanged.\n");
+    }
+}
+ 
+void displayCritical(void) {
+    if (patientCount == 0) { printf("No patient records available.\n"); return; }
+    int found = 0;
+    printf("\n---- Patients Requiring Immediate Attention ----\n");
+    for (int i = 0; i < patientCount; i++) {
+        if (patients[i].risk == HIGH || patients[i].risk == CRITICAL) {
+            printf("ID: %-6d Name: %-20s Risk: %-8s HR:%-4d Temp:%-5.1f SpO2:%-3d%%\n",
+                   patients[i].patientID, patients[i].name, riskName(patients[i].risk),
+                   patients[i].heartRate, patients[i].temperature, patients[i].spo2);
+            found = 1;
+        }
+    }
+    if (!found) printf("No patients currently at HIGH or CRITICAL risk.\n");
+}
+ 
+/* Simple insertion sort by descending risk (then by SpO2 ascending as a
+   tie-breaker so the most urgent patients float to the top within a
+   risk band). Efficiency is analysed in part e. */
+void sortByRisk(void) {
+    for (int i = 1; i < patientCount; i++) {
+        Patient key = patients[i];
+        int j = i - 1;
+        while (j >= 0 &&
+               (patients[j].risk < key.risk ||
+                (patients[j].risk == key.risk && patients[j].spo2 > key.spo2))) {
+            patients[j + 1] = patients[j];
+            j--;
+        }
+        patients[j + 1] = key;
+    }
+    printf("Patients sorted by risk level (most critical first).\n");
+}
+ 
+void generateSummaryReport(void) {
+    if (patientCount == 0) { printf("No patient records available.\n"); return; }
+    int counts[4] = {0, 0, 0, 0};
+    for (int i = 0; i < patientCount; i++) counts[patients[i].risk]++;
+ 
+    printf("\n================ SUMMARY REPORT ================\n");
+    printf("Total registered patients : %d\n", patientCount);
+    printf("  LOW      : %d\n", counts[LOW]);
+    printf("  MODERATE : %d\n", counts[MODERATE]);
+    printf("  HIGH     : %d\n", counts[HIGH]);
+    printf("  CRITICAL : %d\n", counts[CRITICAL]);
+    printf("--------------------------------------------------\n");
+    printf("%-8s %-20s %-5s %-6s %-7s %-6s %-9s\n",
+           "ID", "Name", "Age", "HR", "Temp", "SpO2", "Risk");
+    for (int i = 0; i < patientCount; i++) {
+        Patient *p = &patients[i];
+        printf("%-8d %-20s %-5d %-6d %-7.1f %-6d %-9s\n",
+               p->patientID, p->name, p->age, p->heartRate,
+               p->temperature, p->spo2, riskName(p->risk));
+    }
+    printf("==================================================\n");
+}
+ 
+/* ---------- File persistence ------------------------------------------- */
+ 
+void saveToFile(void) {
+    FILE *fp = fopen(DATA_FILE, "wb");
+    if (fp == NULL) {
+        printf("Error: could not open '%s' for writing.\n", DATA_FILE);
+        return;
+    }
+    fwrite(&patientCount, sizeof(int), 1, fp);
+    fwrite(patients, sizeof(Patient), (size_t)patientCount, fp);
+    fclose(fp);
+    printf("Saved %d patient record(s) to '%s'.\n", patientCount, DATA_FILE);
+}
+ 
+void loadFromFile(void) {
+    FILE *fp = fopen(DATA_FILE, "rb");
+    if (fp == NULL) {
+        /* Not an error on first run: file simply does not exist yet. */
+        patientCount = 0;
+        return;
+    }
+    int count = 0;
+    if (fread(&count, sizeof(int), 1, fp) != 1) { fclose(fp); patientCount = 0; return; }
+    if (count < 0 || count > MAX_PATIENTS) count = 0;  /* guard against a corrupted file */
+    patientCount = (int)fread(patients, sizeof(Patient), (size_t)count, fp);
+    fclose(fp);
+    printf("Loaded %d patient record(s) from '%s'.\n", patientCount, DATA_FILE);
+}
+ 
+/* =========================================================================
+   MENU DRIVER
+   ========================================================================= */
+ 
+void printMenu(void) {
+    printf("\n============ ICU PATIENT MONITORING SYSTEM ============\n");
+    printf("1. Register new patient\n");
+    printf("2. Search patient by ID\n");
+    printf("3. Update vital signs\n");
+    printf("4. Display patients requiring immediate attention\n");
+    printf("5. Sort patients by risk level\n");
+    printf("6. Generate summary report\n");
+    printf("7. Save records to file\n");
+    printf("8. Exit (auto-saves)\n");
+    printf("=========================================================\n");
+}
+ 
+int main(void) {
+    loadFromFile();
+ 
+    int running = 1;
+    while (running) {
+        printMenu();
+        int choice = readIntInRange("Enter choice (1-8): ", 1, 8);
+ 
+        switch (choice) {
+            case 1: registerPatient();      break;
+            case 2: searchPatient();        break;
+            case 3: updateVitalsMenu();     break;
+            case 4: displayCritical();      break;
+            case 5: sortByRisk();           break;
+            case 6: generateSummaryReport();break;
+            case 7: saveToFile();           break;
+            case 8:
+                saveToFile();
+                printf("Exiting. All records saved.\n");
+                running = 0;
+                break;
+        }
+    }
+    return 0;
+}
